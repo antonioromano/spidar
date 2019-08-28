@@ -33,6 +33,7 @@ You can set several options for the crawler in the initializer:
 |`storage`  | False | Persist the crawling data on files under the directory *data*, see next section for more info
 |`debug`    | False | Print information for debug
 |`meta` | {}    | Object which will be persisted along the crawled page, only if `storage` is True
+|`selenium_chrome_driver`|None  | path to the chromedrivre for selenium, if specified the page will be crawled with selenium
 
 ### Storage
 

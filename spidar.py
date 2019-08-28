@@ -1,6 +1,7 @@
 
 import os
 import json
+import time
 import requests
 import validators
 from bs4 import BeautifulSoup
@@ -8,12 +9,13 @@ from bs4.element import Comment
 from reppy.robots import Robots
 from urllib.parse import urljoin
 from urllib.parse import urlparse
+from selenium import webdriver
 
 
 class Spidar:
 
     def __init__(self, url, limit_pages_counter=1, storage=False, meta={}, debug=False, user_agent='Spidar/1.1',
-                 allow_external_link_crawling=False):
+                 allow_external_link_crawling=False, selenium_chrome_driver=None):
         self.__start_url = url
         parse_location = urlparse(url)
         self.__initial_domain_name = parse_location.netloc
@@ -29,6 +31,10 @@ class Spidar:
         self.__debug = debug
         self.__user_agent = user_agent
         self.__allow_external_link_crawling = allow_external_link_crawling
+        self.__selenium_chrome_driver = selenium_chrome_driver
+        self.__selenium_driver = None
+        if self.__selenium_chrome_driver is not None:
+            self.__selenium_driver = webdriver.Chrome(executable_path=self.__selenium_chrome_driver)
 
         self.__rp = Robots.fetch(Robots.robots_url(self.__start_url))
 
@@ -70,6 +76,39 @@ class Spidar:
         if validators.url(link) and link not in self.__url_discovered:
             self.__url_to_discover.add(link)
 
+    def __crawl_page_request(self, url):
+        r = requests.get(url, stream=True, headers={'User-Agent': self.__user_agent})
+
+        if 'Content-Type' not in r.headers or 'text' not in r.headers['Content-Type']:
+            self.__print_debug('page does not contains text')
+            r.close()
+            return None, None, None
+        else:
+            content = b''
+            is_html = 'html' in r.headers['Content-Type']
+            language = None
+            if 'Content-language' in r.headers:
+                language = r.headers['Content-language']
+            for line in r.iter_lines():
+                if line:
+                    content += line
+            r.close()
+
+            if r.status_code >= 300:
+                return None, None, None
+        return content, is_html, language
+
+    def __crawl_page_selenium(self, url):
+        self.__selenium_driver.get(url)
+        time.sleep(1)
+
+        return self.__selenium_driver.page_source.encode('utf-8'), True, None
+
+    def __crawl_page(self, url):
+        if self.__selenium_driver is not None:
+            return self.__crawl_page_selenium(url)
+        return self.__crawl_page_request(url)
+
     def __extract_info(self, url):
 
         self.__print_debug('crawling page', url)
@@ -85,73 +124,57 @@ class Spidar:
                 self.__print_debug('disallowed by user agent')
                 return None
 
-        r = requests.get(url, stream=True, headers={'User-Agent': self.__user_agent})
-
-        if 'Content-Type' not in r.headers or 'text' not in r.headers['Content-Type']:
-            self.__print_debug('page does not contains text')
-            r.close()
+        content, is_html, language = self.__crawl_page(url)
+        if content is None:
             return None
-        else:
-            content = b''
-            is_html = 'html' in r.headers['Content-Type']
-            language = None
-            if 'Content-language' in r.headers:
-                language = r.headers['Content-language']
-            for line in r.iter_lines():
-                if line:
-                    content += line
-            r.close()
 
-            if r.status_code >= 300:
-                return None
+        path = urlparse(url).path.replace('/', '_')
+        if path is None or path == '':
+            path = '__index__'
 
-            path = urlparse(url).path.replace('/', '_')
-            if path is None or path == '':
-                path = '__index__'
+        if self.__storage:
+            self.__set_up_folders(parsed_url.netloc)
+            fsource = open(self.__PATH_SOURCE + parsed_url.netloc + '/' + path + '.html', 'wb')
+            fsource.write(content)
+            fsource.close()
 
-            if self.__storage:
-                self.__set_up_folders(parsed_url.netloc)
-                fsource = open(self.__PATH_SOURCE + parsed_url.netloc + '/' + path + '.html', 'wb')
-                fsource.write(content)
-                fsource.close()
+        if not is_html:
+            self.__pages.append({'content': content, 'language': language, 'url': url, 'html': content})
+            return content
+        soup = BeautifulSoup(content, 'html.parser')
 
-            if not is_html:
-                self.__pages.append({'content': content, 'language': language, 'url': url, 'html': content})
-                return content
-            soup = BeautifulSoup(content, 'html.parser')
+        for link in soup.find_all('a'):
+            href = link.get('href')
+            if href is None or '#' in href:
+                continue
+            if href.startswith('http'):
+                self.__add_url(href)
+                continue
 
-            for link in soup.find_all('a'):
-                href = link.get('href')
-                if href is None or '#' in href:
-                    continue
-                if href.startswith('http'):
-                    self.__add_url(href)
-                    continue
+            if href.startswith('mailto'):
+                continue
 
-                if href.startswith('mailto'):
-                    continue
+            new_url = str(urljoin(url, href))
+            self.__add_url(new_url)
+        texts = soup.findAll(text=True)
+        visible_texts = filter(self.__tag_visible, texts)
 
-                new_url = str(urljoin(url, href))
-                self.__add_url(new_url)
-            texts = soup.findAll(text=True)
-            visible_texts = filter(self.__tag_visible, texts)
+        visible_texts = ' '.join(t.strip() for t in visible_texts if t.strip() != '')
 
-            visible_texts = ' '.join(t.strip() for t in visible_texts if t.strip() != '')
+        if self.__storage:
+            fout = open(self.__PATH_INFO + parsed_url.netloc + '/' + path + '.json', 'w')
+            fout.write(json.dumps({'url': url,
+                                   'domain_name': parsed_url.netloc,
+                                   'html': content.decode('utf-8'),
+                                   'language': language,
+                                   'content': visible_texts,
+                                   'meta': self.__meta, }))
+            fout.close()
 
-            if self.__storage:
-                fout = open(self.__PATH_INFO + parsed_url.netloc + '/' + path + '.json', 'w')
-                fout.write(json.dumps({'url': url,
-                                       'domain_name': parsed_url.netloc,
-                                       'html': content.decode('utf-8'),
-                                       'language': language,
-                                       'content': visible_texts,
-                                       'meta': self.__meta, }))
-                fout.close()
-
-            self.__pages.append({'content': visible_texts,
-                                 'language': language,
-                                 'url': url,
-                                 'html': content})
+        self.__pages.append({'content': visible_texts,
+                             'language': language,
+                             'url': url,
+                             'html': content})
 
     @staticmethod
     def __tag_visible(element):
@@ -168,6 +191,12 @@ def test(limit_pages=5, storage=True):
     print(res)
 
 
-if __name__ == '__main__':
+def test_selenium(limit_pages=5, storage=True):
+    s = Spidar('https://www.wikipedia.org', limit_pages_counter=limit_pages, storage=storage, debug=True,
+               allow_external_link_crawling=True, selenium_chrome_driver='/Users/macbookpro7/development/libs/chromedriver')
+    res = s.crawl()
+    print(res)
 
-    test()
+
+if __name__ == '__main__':
+    test_selenium()
